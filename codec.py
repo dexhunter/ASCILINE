@@ -235,57 +235,98 @@ def _enc_plane(cur,prev,ftype,use_mv,qm,DZ,SKIP_T):
     blocks=cur.reshape(nby,8,nbx,8).transpose(0,2,1,3).astype(np.float64)
     mvx=np.zeros((nby,nbx),np.int64); mvy=np.zeros((nby,nbx),np.int64)
     if ftype==0:
-        pred=np.full((nby,nbx,8,8),128.0)
+        pred=128.0
     elif use_mv:
-        curi=cur.astype(np.int16); pad=np.pad(prev,R_SEARCH,mode='edge').astype(np.int16)
-        # integer SADs: einsum reduces ~2x faster than a tuple-axis sum, same integers
-        _sad=lambda d: np.einsum('aibj->ab',np.abs(d).astype(np.int32).reshape(nby,8,nbx,8))
-        best=_sad(curi-prev.astype(np.int16)).astype(np.int64)
-        for dy in range(-R_SEARCH,R_SEARCH+1):
-            for dx in range(-R_SEARCH,R_SEARCH+1):
-                if dx==0 and dy==0: continue
-                sh=pad[R_SEARCH+dy:R_SEARCH+dy+ph,R_SEARCH+dx:R_SEARCH+dx+pw]
-                sad=_sad(curi-sh)
-                m=sad<best; best=np.where(m,sad,best); mvx=np.where(m,dx,mvx); mvy=np.where(m,dy,mvy)
-        padu=np.pad(prev,R_SEARCH,mode='edge')
-        ry=(R_SEARCH+np.arange(nby)[:,None]*8+mvy)[:,:,None]+np.arange(8)
-        rx=(R_SEARCH+np.arange(nbx)[None,:]*8+mvx)[:,:,None]+np.arange(8)
-        pred=padu[ry[:,:,:,None],rx[:,:,None,:]].astype(np.float64)  # edge-pad == the decoder's clamp
+        curi=cur.astype(np.int16); padu=np.pad(prev,R_SEARCH,mode='edge')
+        pad=padu.astype(np.int16)
+        width=2*R_SEARCH+1
+        shifts=np.lib.stride_tricks.sliding_window_view(pad,(ph,pw))
+        # Batch as many displacement rows as fit in about 1 MiB of differences.
+        rows_per_chunk=min(width,max(1,(1024*1024)//(width*ph*pw*2)))
+        diff=np.empty((rows_per_chunk,width,ph,pw),dtype=np.int16)
+        diff_blocks=diff.reshape(rows_per_chunk*width,nby,8,nbx,8)
+        sad=np.empty((nby,nbx,width*width),dtype=np.int32)
+        for start in range(0,width,rows_per_chunk):
+            rows=min(rows_per_chunk,width-start)
+            count=rows*width
+            np.subtract(curi,shifts[start:start+rows],out=diff[:rows])
+            np.abs(diff[:rows],out=diff[:rows])
+            np.einsum('kaibj->abk',diff_blocks[:count],dtype=np.int32,
+                      out=sad[:,:,start*width:start*width+count])
+        # Store only block SADs across chunks; select the first strict improvement once.
+        # The zero-motion SAD is the centre displacement, so it is read rather than recomputed.
+        best=sad[:,:,R_SEARCH*width+R_SEARCH]
+        choice=sad.argmin(axis=2)
+        row_best=np.take_along_axis(sad,choice[:,:,None],axis=2)[:,:,0]
+        m=row_best<best
+        np.copyto(mvx,choice%width-R_SEARCH,where=m)
+        np.copyto(mvy,choice//width-R_SEARCH,where=m)
+        # Gather each block's displaced 8x8 window; edge-pad == the decoder's clamp.
+        win=np.lib.stride_tricks.sliding_window_view(padu,(8,8))
+        pred=win[R_SEARCH+np.arange(nby)[:,None]*8+mvy,R_SEARCH+np.arange(nbx)[None,:]*8+mvx]
     else:
-        pred=prev.reshape(nby,8,nbx,8).transpose(0,2,1,3).astype(np.float64)
-    resid=blocks-pred
+        pred=prev.reshape(nby,8,nbx,8).transpose(0,2,1,3)
+    # Integer uint8 predictors widen exactly to float64 inside the subtraction.
+    resid=blocks
+    np.subtract(blocks,pred,out=resid)
     _t=(_F@resid@_F.T)/qm
-    Cq=np.round(_t)
-    if DZ>0.5: Cq=np.where(np.abs(_t)<DZ,0.0,Cq)
-    Cq=Cq.astype(np.int64)
+    Cqf=np.round(_t)
+    if DZ>0.5:
+        np.abs(_t,out=_t)
+        Cqf[_t<DZ]=0.0
+    skip=None
     if ftype==1:
-        sse=(resid*resid).sum(axis=(2,3))
-        skip=((mvx==0)&(mvy==0))&((~Cq.any(axis=(2,3)))|((SKIP_T>0)&(sse<SKIP_T)))
+        skip=~Cqf.any(axis=(2,3))
+        if SKIP_T>0:
+            # Squared integer residuals sum exactly in any order.
+            skip|=np.einsum('abij,abij->ab',resid,resid)<SKIP_T
+        if use_mv:
+            skip&=(mvx==0)&(mvy==0)
+    # Integer reconstruction carried in float64: every operand and partial sum is an
+    # integer far below 2**53, so the BLAS products and the power-of-two rounding
+    # shift are exact and match the int64 (x+2048)//4096 arithmetic.
+    flat=Cqf.reshape(nb,64)
+    if skip is None:
+        order=np.arange(nb)
+        zzf=flat[:,ZZ].astype(np.int64)
     else:
-        skip=np.zeros((nby,nbx),bool)
-    rec=np.clip(pred.astype(np.int64)+((MIT@(Cq*qm)@MI+2048)//4096),0,255).astype(np.uint8)
-    if ftype==1:
-        rec=np.where(skip[:,:,None,None],prev.reshape(nby,8,nbx,8).transpose(0,2,1,3),rec)
-    recon=np.ascontiguousarray(rec.transpose(0,2,1,3).reshape(ph,pw))
-    order=np.nonzero((~skip).reshape(-1))[0]
-    zzf=Cq.reshape(nb,64)[:,ZZ][order]
-    if len(order):
-        zzf=zzf.copy(); zzf[:,0]=np.diff(zzf[:,0],prepend=0)  # DC DPCM over coded blocks, raster order
+        order=np.flatnonzero(~skip)
+        zzf=flat[order[:,None],ZZ].astype(np.int64)
+    np.multiply(Cqf,qm,out=Cqf)
+    # Scaling MI by 1/4096 is exact, so floor(x/4096+0.5) == (x+2048)//4096.
+    rec=MIT.astype(np.float64)@Cqf@(MI*(1.0/4096))
+    rec+=0.5
+    np.floor(rec,out=rec)
+    rec+=pred
+    np.clip(rec,0,255,out=rec)
+    # Cast and restore raster layout in one pass, then copy skipped blocks from prev.
+    recon=np.empty((ph,pw),np.uint8)
+    recb=recon.reshape(nby,8,nbx,8)
+    np.copyto(recb,rec.transpose(0,2,1,3),casting='unsafe')
+    if skip is not None:
+        np.copyto(recb,prev.reshape(nby,8,nbx,8),where=skip[:,None,:,None])
+    zzf[1:,0]-=zzf[:-1,0]  # DC DPCM over coded blocks, raster order
     bidx,pos=np.nonzero(zzf)
-    same=np.zeros(len(pos),bool); same[1:]=bidx[1:]==bidx[:-1]
-    prevpos=np.where(same,np.concatenate(([0],pos[:-1])),-1)
+    prevpos=np.empty_like(pos); prevpos[:1]=-1
+    prevpos[1:]=np.where(bidx[1:]==bidx[:-1],pos[:-1],-1)
     vals=zzf[bidx,pos]
     assert not len(vals) or np.abs(vals).max()<32768, "profile: coefficient out of int16 range"
-    pairs=np.empty(len(pos),dtype=np.dtype([('r','u1'),('v','<i2')]))  # packed 3B == struct '<Bh'
-    pairs['r']=(pos-prevpos-1).astype(np.uint8); pairs['v']=vals
-    pb=pairs.tobytes(); counts=(zzf!=0).sum(1) if len(order) else np.zeros(0,np.int64)
-    offs=np.concatenate(([0],np.cumsum(counts)))*3
-    mvxf=mvx.reshape(-1); mvyf=mvy.reshape(-1); blob=bytearray()
-    for j,b in enumerate(order):
-        if ftype==1 and use_mv: blob+=struct.pack('bb',int(mvxf[b]),int(mvyf[b]))
-        blob+=bytes([counts[j]])+pb[offs[j]:offs[j+1]]
+    counts=np.bincount(bidx,minlength=len(order))
+    header_size=3 if ftype==1 and use_mv else 1
+    # Place block headers by prefix sums and coefficient triples in wire order.
+    starts=np.arange(len(order))*header_size
+    starts[1:]+=np.cumsum(counts[:-1])*3
+    blob=np.empty(len(order)*header_size+len(pos)*3,dtype=np.uint8)
+    blob[starts+header_size-1]=counts
+    if header_size==3:
+        blob[starts]=mvx.reshape(-1)[order].astype(np.int8).view(np.uint8)
+        blob[starts+1]=mvy.reshape(-1)[order].astype(np.int8).view(np.uint8)
+    offsets=(bidx+1)*header_size+np.arange(len(pos))*3
+    blob[offsets]=pos-prevpos-1
+    blob[offsets+1]=vals
+    blob[offsets+2]=vals>>8  # Signed coefficients, little-endian int16.
     head=np.packbits(skip.reshape(-1)).tobytes() if ftype==1 else b''
-    return head+bytes(blob),recon
+    return head+blob.tobytes(),recon
 
 class ProfileEncoder:
     def __init__(self, W, H, QF=70, DZ=0.75, SKIP_T=256, level=6):
